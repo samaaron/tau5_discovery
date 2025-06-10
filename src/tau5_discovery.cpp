@@ -143,9 +143,15 @@ static ERL_NIF_TERM is_nif_logging_enabled(ErlNifEnv *env, int argc, const ERL_N
   return enif_make_atom(env, enabled ? "true" : "false");
 }
 
+ERL_NIF_TERM is_nif_loaded(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+{
+  return enif_make_atom(env, "true");
+}
+
 // PRODUCTION READY: Clean function table with dirty scheduler
 static ErlNifFunc nif_funcs[] = {
     // name, arity, function, flags
+    {"is_nif_loaded", 0, is_nif_loaded, 0},
     {"start", 1, start_discovery_dirty, ERL_NIF_DIRTY_JOB_IO_BOUND},  // RESTORED: Dirty scheduler for heavy I/O
     {"stop", 0, stop_discovery, 0},
     {"list", 0, list_peers, 0},
