@@ -53,7 +53,14 @@ typedef int socket_t;
 #define close_socket close
 #endif
 
-
+// Cross-platform setsockopt macro
+#ifdef _WIN32
+// Windows requires const char* for setsockopt
+#define SETSOCKOPT_CAST(x) reinterpret_cast<const char*>(x)
+#else
+// Unix accepts const void* which doesn't need a cast
+#define SETSOCKOPT_CAST(x) (x)
+#endif
 
 // Constants - Rate limiting like Link
 static const char *MULTICAST_IP_V4 = "224.76.78.75";
@@ -952,7 +959,7 @@ bool NetworkInterface::start()
     if (info_.is_ipv6)
     {
       unsigned int idx = info_.scope_id;
-      if (setsockopt(socket_fd_, IPPROTO_IPV6, IPV6_MULTICAST_IF, &idx, sizeof(idx)) < 0)
+      if (setsockopt(socket_fd_, IPPROTO_IPV6, IPV6_MULTICAST_IF, SETSOCKOPT_CAST(&idx), sizeof(idx)) < 0)
       {
         LOG("Warning: Failed to set IPv6 multicast interface for " << info_.name);
       }
@@ -961,7 +968,7 @@ bool NetworkInterface::start()
     {
       struct in_addr localIf;
       inet_pton(AF_INET, info_.ip_address.c_str(), &localIf);
-      if (setsockopt(socket_fd_, IPPROTO_IP, IP_MULTICAST_IF, &localIf, sizeof(localIf)) < 0)
+      if (setsockopt(socket_fd_, IPPROTO_IP, IP_MULTICAST_IF, SETSOCKOPT_CAST(&localIf), sizeof(localIf)) < 0)
       {
         LOG("Warning: Failed to set IPv4 multicast interface for " << info_.name);
       }
@@ -1938,7 +1945,7 @@ ERL_NIF_TERM list_peers_impl(ErlNifEnv *env)
   for (const auto &peer : peers)
   {
     ErlNifBinary info_bin;
-    enif_alloc_binary(peer.info_string.length(), &info_bin);
+    enif_alloc_binary(static_cast<unsigned int>(peer.info_string.length()), &info_bin);
     memcpy(info_bin.data, peer.info_string.c_str(), peer.info_string.length());
 
     ERL_NIF_TERM peer_term = enif_make_tuple4(env,

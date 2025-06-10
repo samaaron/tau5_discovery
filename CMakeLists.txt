@@ -98,13 +98,19 @@ endif()
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     target_compile_options(libtau5_discovery PRIVATE
         -Wall -Wextra -Wpedantic
-        -O2
     )
+    # Add optimization for Release builds only
+    if(CMAKE_BUILD_TYPE STREQUAL "Release")
+        target_compile_options(libtau5_discovery PRIVATE -O2)
+    endif()
 elseif(MSVC)
     target_compile_options(libtau5_discovery PRIVATE
         /W4
-        /O2
     )
+    # Add optimization for Release builds only
+    if(CMAKE_BUILD_TYPE STREQUAL "Release")
+        target_compile_options(libtau5_discovery PRIVATE /O2)
+    endif()
 endif()
 
 # Debug configuration
