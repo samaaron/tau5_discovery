@@ -101,12 +101,35 @@ struct NetworkError : std::runtime_error
 static std::atomic<bool> g_logging_enabled{false};
 static std::mutex g_log_mutex;
 
-// Helper function for thread-safe time formatting
+// FIX 7: Windows resource management
+#ifdef _WIN32
+static std::once_flag g_wsa_init_flag;
+static std::atomic<bool> g_wsa_initialized{false};
+
+static void initialize_wsa() {
+  WSADATA wsaData;
+  if (WSAStartup(MAKEWORD(2, 2), &wsaData) == 0) {
+    g_wsa_initialized.store(true);
+    std::atexit([]() {
+      if (g_wsa_initialized.load()) {
+        WSACleanup();
+      }
+    });
+  }
+}
+#endif
+
+// FIX 3: Safe time formatting with proper null check
 inline std::tm* safe_localtime(std::time_t time_val, std::tm* tm_buf) {
 #ifdef _WIN32
   return (localtime_s(tm_buf, &time_val) == 0) ? tm_buf : nullptr;
 #else
-  return std::localtime(&time_val);
+  std::tm* result = std::localtime(&time_val);
+  if (result && tm_buf) {
+    *tm_buf = *result;
+    return tm_buf;
+  }
+  return nullptr;
 #endif
 }
 
@@ -133,7 +156,7 @@ inline std::tm* safe_localtime(std::time_t time_val, std::tm* tm_buf) {
     }                                                              \
   } while (0)
 
-// Simple IPv6 scope checker - Link-compatible behavior (ONLY NEW ADDITION)
+// Simple IPv6 scope checker - Link-compatible behavior
 class SimpleIPv6ScopeFilter
 {
 public:
@@ -233,7 +256,7 @@ bool is_valid_utf8(const std::string& str)
   return true;
 }
 
-// Enhanced timer class replacing sleep-based threads
+// FIX 2: Enhanced timer class with proper lifetime management
 class Timer
 {
 public:
@@ -244,6 +267,7 @@ private:
   std::mutex mutex_;
   std::condition_variable cv_;
   std::atomic<bool> running_{false};
+  std::atomic<bool> stopping_{false};
   std::thread thread_;
   Duration next_interval_;
   std::atomic<bool> interval_changed_{false};
@@ -262,16 +286,17 @@ public:
       return;
 
     running_.store(true);
+    stopping_.store(false);
     next_interval_ = interval;
     thread_ = std::thread([this, callback]()
                           {
             std::unique_lock<std::mutex> lock(mutex_);
-            while (running_.load()) {
+            while (running_.load() && !stopping_.load()) {
                 auto current_interval = next_interval_;
                 if (cv_.wait_for(lock, current_interval, [this] {
-                    return !running_.load() || interval_changed_.load();
+                    return !running_.load() || stopping_.load() || interval_changed_.load();
                 })) {
-                    if (!running_.load()) {
+                    if (!running_.load() || stopping_.load()) {
                         break; // Signaled to stop
                     }
                     if (interval_changed_.load()) {
@@ -279,9 +304,15 @@ public:
                         continue; // Use new interval
                     }
                 }
-                if (running_.load()) {
+                if (running_.load() && !stopping_.load()) {
                     lock.unlock();
-                    callback();
+                    try {
+                        callback();
+                    } catch (const std::exception& e) {
+                        LOG("Timer callback exception: " << e.what());
+                    } catch (...) {
+                        LOG("Timer callback unknown exception");
+                    }
                     lock.lock();
                 }
             } });
@@ -302,6 +333,7 @@ public:
   {
     {
       std::lock_guard<std::mutex> lock(mutex_);
+      stopping_.store(true);
       running_.store(false);
     }
     cv_.notify_all();
@@ -404,7 +436,7 @@ struct PeerInfo
     endpoints.emplace_back(ip, iface, is_wired);
   }
 
-  // Feature 2: Endpoint selection logic
+  // Feature 2: Endpoint selection logic - UPDATED FOR BROWSER COMPATIBILITY
   const Endpoint* select_endpoint() const
   {
     if (endpoints.empty()) return nullptr;
@@ -414,7 +446,30 @@ struct PeerInfo
       if (ep.preferred) return &ep;
     }
 
-    // 2. Wired before wireless
+    // 2. IPv4 addresses (best for browsers)
+    const Endpoint* best_ipv4 = nullptr;
+    for (const auto& ep : endpoints) {
+      if (ep.ip_address.find(':') == std::string::npos) {  // No colon = IPv4
+        if (!best_ipv4 || ep.last_seen > best_ipv4->last_seen) {
+          best_ipv4 = &ep;
+        }
+      }
+    }
+    if (best_ipv4) return best_ipv4;
+
+    // 3. Global IPv6 addresses (not link-local)
+    const Endpoint* best_global_ipv6 = nullptr;
+    for (const auto& ep : endpoints) {
+      if (ep.ip_address.find(':') != std::string::npos &&
+          ep.ip_address.substr(0, 4) != "fe80") {  // Not link-local
+        if (!best_global_ipv6 || ep.last_seen > best_global_ipv6->last_seen) {
+          best_global_ipv6 = &ep;
+        }
+      }
+    }
+    if (best_global_ipv6) return best_global_ipv6;
+
+    // 4. Wired before wireless (for link-local as last resort)
     const Endpoint* best_wired = nullptr;
     const Endpoint* best_wireless = nullptr;
 
@@ -433,7 +488,7 @@ struct PeerInfo
     if (best_wired) return best_wired;
     if (best_wireless) return best_wireless;
 
-    // 3. Freshest last_seen
+    // 5. Freshest last_seen as final fallback
     return &(*std::max_element(endpoints.begin(), endpoints.end(),
       [](const Endpoint& a, const Endpoint& b) {
         return a.last_seen < b.last_seen;
@@ -487,6 +542,7 @@ struct Message
     return data;
   }
 
+  // FIX 4: Buffer overflow prevention in deserialization
   bool deserialize(const uint8_t *buffer, size_t length)
   {
     if (length < 8 + 36)
@@ -511,14 +567,12 @@ struct Message
     if (length < 8 + 36 + info_length)
       return false;
 
-    peer_id.assign(reinterpret_cast<const char *>(buffer + 8), 36);
-    size_t null_pos = peer_id.find('\0');
-    if (null_pos != std::string::npos)
-    {
-      peer_id.resize(null_pos);
-    }
+    // FIX 4: Safe peer_id extraction with proper null termination handling
+    const char* id_ptr = reinterpret_cast<const char *>(buffer + 8);
+    size_t id_len = strnlen(id_ptr, 36);
+    peer_id.assign(id_ptr, id_len);
 
-    if (info_length > 0)
+    if (info_length > 0 && info_length <= MAX_INFO_STRING_LEN)
     {
       info_string.assign(reinterpret_cast<const char *>(buffer + 8 + 36), info_length);
     }
@@ -530,7 +584,7 @@ struct Message
 // Forward declarations
 class DiscoveryService;
 
-// Enhanced network interface with proper IPv6 scope handling and error recovery
+// FIX 1: Enhanced network interface with weak_ptr to service
 class NetworkInterface
 {
 private:
@@ -539,7 +593,7 @@ private:
   socket_t unicast_socket_fd_; // unicast socket for responses
   std::thread receive_thread_;
   std::atomic<bool> running_;
-  DiscoveryService *service_;
+  std::weak_ptr<DiscoveryService> service_; // FIX 1: Use weak_ptr
   std::atomic<int> error_count_{0};
 
   // Feature 3: Rate limiting
@@ -548,7 +602,7 @@ private:
   std::atomic<int> msgs_this_sec_{0};
 
 public:
-  NetworkInterface(const InterfaceInfo &info, DiscoveryService *service)
+  NetworkInterface(const InterfaceInfo &info, std::weak_ptr<DiscoveryService> service)
       : info_(info), socket_fd_(INVALID_SOCKET_VALUE), unicast_socket_fd_(INVALID_SOCKET_VALUE),
         running_(false), service_(service), last_rate_reset_(std::chrono::steady_clock::now()) {}
 
@@ -569,7 +623,7 @@ public:
   bool is_running() const { return running_.load(); }
 };
 
-// Enhanced peer manager with better lifecycle management
+// FIX 6: Enhanced peer manager with ordered locking
 class PeerManager
 {
 private:
@@ -773,17 +827,18 @@ public:
   }
 };
 
-// Interface manager with dynamic scanning and repair
+// FIX 5: Interface manager with better synchronization
 class InterfaceManager
 {
 private:
   mutable std::mutex interfaces_mutex_;
   std::map<InterfaceInfo, std::unique_ptr<NetworkInterface>> interfaces_;
-  DiscoveryService *service_;
+  std::weak_ptr<DiscoveryService> service_; // FIX 5: Use weak_ptr
   Timer scan_timer_;
+  std::atomic<bool> stopping_{false};
 
 public:
-  InterfaceManager(DiscoveryService *service) : service_(service) {}
+  InterfaceManager(std::weak_ptr<DiscoveryService> service) : service_(service) {}
 
   ~InterfaceManager()
   {
@@ -806,7 +861,7 @@ private:
 };
 
 // Main discovery service with enhanced architecture
-class DiscoveryService
+class DiscoveryService : public std::enable_shared_from_this<DiscoveryService>
 {
 private:
   std::atomic<bool> running_;
@@ -823,13 +878,16 @@ public:
                        last_broadcast_time_(std::chrono::steady_clock::now())
   {
     my_peer_id_ = generate_uuid();
-    interface_manager_ = std::make_unique<InterfaceManager>(this);
     LOG("Discovery service created with peer ID: " << my_peer_id_);
   }
 
   ~DiscoveryService()
   {
     stop();
+  }
+
+  void initialize() {
+    interface_manager_ = std::make_unique<InterfaceManager>(weak_from_this());
   }
 
   bool start(const std::string &info_string);
@@ -867,7 +925,7 @@ private:
 };
 
 // Global service instance
-static std::unique_ptr<DiscoveryService> g_service;
+static std::shared_ptr<DiscoveryService> g_service;
 static std::mutex g_service_mutex;
 
 #ifdef __APPLE__
@@ -900,9 +958,9 @@ bool NetworkInterface::start()
   try
   {
 #ifdef _WIN32
-    WSADATA wsaData;
-    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
-    {
+    // FIX 7: Use once_flag for WSA initialization
+    std::call_once(g_wsa_init_flag, initialize_wsa);
+    if (!g_wsa_initialized.load()) {
       throw NetworkError("WSAStartup failed", info_.name, info_.ip_address);
     }
 #endif
@@ -1158,6 +1216,7 @@ bool NetworkInterface::send_message(const Message &msg)
   }
 }
 
+// FIX 9: Improved IPv6 scope handling
 bool NetworkInterface::send_unicast_message(const Message &msg, const std::string &target_ip)
 {
   if (!running_.load() || unicast_socket_fd_ == INVALID_SOCKET_VALUE)
@@ -1172,15 +1231,22 @@ bool NetworkInterface::send_unicast_message(const Message &msg, const std::strin
 
     if (info_.is_ipv6)
     {
-      // Feature 4: Strip scope suffix before inet_pton
-      std::string clean = target_ip;
-      auto pct = clean.find('%');
-      if (pct != std::string::npos) clean.resize(pct);
+      // FIX 9: Better scope suffix handling
+      std::string clean_ip = target_ip;
+      size_t pct_pos = clean_ip.find('%');
+      if (pct_pos != std::string::npos) {
+        // Extract everything before '%' as the IP address
+        clean_ip = clean_ip.substr(0, pct_pos);
+      }
 
       struct sockaddr_in6 addr = {};
       addr.sin6_family = AF_INET6;
       addr.sin6_port = htons(MULTICAST_PORT);
-      inet_pton(AF_INET6, clean.c_str(), &addr.sin6_addr);
+
+      if (inet_pton(AF_INET6, clean_ip.c_str(), &addr.sin6_addr) != 1) {
+        throw NetworkError("Invalid IPv6 address", info_.name, target_ip);
+      }
+
       addr.sin6_scope_id = info_.scope_id;
 
       ssize_t sent = sendto(unicast_socket_fd_, reinterpret_cast<const char *>(data.data()), static_cast<int>(data.size()), 0,
@@ -1196,7 +1262,10 @@ bool NetworkInterface::send_unicast_message(const Message &msg, const std::strin
       struct sockaddr_in addr = {};
       addr.sin_family = AF_INET;
       addr.sin_port = htons(MULTICAST_PORT);
-      inet_pton(AF_INET, target_ip.c_str(), &addr.sin_addr);
+
+      if (inet_pton(AF_INET, target_ip.c_str(), &addr.sin_addr) != 1) {
+        throw NetworkError("Invalid IPv4 address", info_.name, target_ip);
+      }
 
       ssize_t sent = sendto(unicast_socket_fd_, reinterpret_cast<const char *>(data.data()), static_cast<int>(data.size()), 0,
                             reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr));
@@ -1217,123 +1286,135 @@ bool NetworkInterface::send_unicast_message(const Message &msg, const std::strin
   }
 }
 
-// MINIMAL CHANGE: Enhanced receive_loop with simple ASIO IPv6 filtering
+// FIX 8: Enhanced receive_loop with exception handling
 void NetworkInterface::receive_loop()
 {
   LOG("Receive loop started for interface: " << info_.to_string());
 
   uint8_t buffer[1024];
 
-  while (running_.load())
-  {
-    try
+  // FIX 8: Wrap entire loop in exception handler
+  try {
+    while (running_.load())
     {
-      // Feature 3: Rate limiting check
+      try
       {
-        auto now = std::chrono::steady_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_rate_reset_);
+        // Feature 3: Rate limiting check
+        {
+          auto now = std::chrono::steady_clock::now();
+          auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_rate_reset_);
 
-        if (elapsed >= std::chrono::seconds(1)) {
-          std::lock_guard<std::mutex> lock(rate_mtx_);
-          last_rate_reset_ = now;
-          msgs_this_sec_.store(0);
+          if (elapsed >= std::chrono::seconds(1)) {
+            std::lock_guard<std::mutex> lock(rate_mtx_);
+            last_rate_reset_ = now;
+            msgs_this_sec_.store(0);
+          }
+
+          if (msgs_this_sec_.load() >= MAX_MESSAGES_PER_SECOND) {
+            // Drop packet by reading and discarding it
+            // IMPORTANT: Must actually drain the datagram to prevent kernel queue growth
+            struct sockaddr_storage trash_addr;
+            socklen_t trash_len = sizeof(trash_addr);
+            recvfrom(socket_fd_, reinterpret_cast<char *>(buffer), sizeof(buffer), 0,
+                     reinterpret_cast<struct sockaddr *>(&trash_addr), &trash_len);
+            continue;
+          }
         }
 
-        if (msgs_this_sec_.load() >= MAX_MESSAGES_PER_SECOND) {
-          // Drop packet by reading and discarding it
-          // IMPORTANT: Must actually drain the datagram to prevent kernel queue growth
-          struct sockaddr_storage trash_addr;
-          socklen_t trash_len = sizeof(trash_addr);
-          recvfrom(socket_fd_, reinterpret_cast<char *>(buffer), sizeof(buffer), 0,
-                   reinterpret_cast<struct sockaddr *>(&trash_addr), &trash_len);
+        struct sockaddr_storage sender_addr = {};
+        socklen_t addr_len = sizeof(sender_addr);
+
+        ssize_t received = recvfrom(socket_fd_, reinterpret_cast<char *>(buffer), sizeof(buffer), 0,
+                                    reinterpret_cast<struct sockaddr *>(&sender_addr), &addr_len);
+
+        if (received <= 0)
+        {
+          if (running_.load())
+          {
+            throw NetworkError("Receive error", info_.name, info_.ip_address);
+          }
           continue;
         }
+
+        // Feature 3: Increment message counter
+        msgs_this_sec_.fetch_add(1);
+
+        // Parse sender IP
+        std::string sender_ip;
+
+        if (sender_addr.ss_family == AF_INET)
+        {
+          char ip_str[INET_ADDRSTRLEN];
+          struct sockaddr_in *addr_in = reinterpret_cast<struct sockaddr_in *>(&sender_addr);
+          inet_ntop(AF_INET, &addr_in->sin_addr, ip_str, INET_ADDRSTRLEN);
+          sender_ip = ip_str;
+        }
+        else if (sender_addr.ss_family == AF_INET6)
+        {
+          char ip_str[INET6_ADDRSTRLEN];
+          struct sockaddr_in6 *addr_in6 = reinterpret_cast<struct sockaddr_in6 *>(&sender_addr);
+          inet_ntop(AF_INET6, &addr_in6->sin6_addr, ip_str, INET6_ADDRSTRLEN);
+          sender_ip = ip_str;
+
+          // For IPv6, include scope in the sender_ip string if it has one
+          try
+          {
+            auto sender_asio_addr = asio::ip::make_address_v6(sender_ip);
+            sender_asio_addr.scope_id(addr_in6->sin6_scope_id);
+            sender_ip = sender_asio_addr.to_string(); // This will include scope if needed
+          }
+          catch (const std::exception &e)
+          {
+            LOG("Failed to parse IPv6 sender address: " << e.what());
+            continue;
+          }
+        }
+
+        // Skip messages from ourselves
+        if (sender_ip == info_.ip_address)
+        {
+          continue;
+        }
+
+        // SIMPLE ASIO-based scope filtering
+        if (!SimpleIPv6ScopeFilter::shouldAcceptMessage(sender_ip, info_.ip_address))
+        {
+          LOG("Filtered message from " << sender_ip << " on " << info_.name);
+          continue;
+        }
+
+        // Parse message
+        Message msg;
+        if (msg.deserialize(buffer, received))
+        {
+          // FIX 1: Use weak_ptr to safely access service
+          if (auto service = service_.lock())
+          {
+            service->handle_received_message(msg, sender_ip, info_.name, info_.is_wired);
+          }
+        }
+
+        // Reset error count on successful receive
+        error_count_.store(0);
       }
-
-      struct sockaddr_storage sender_addr = {};
-      socklen_t addr_len = sizeof(sender_addr);
-
-      ssize_t received = recvfrom(socket_fd_, reinterpret_cast<char *>(buffer), sizeof(buffer), 0,
-                                  reinterpret_cast<struct sockaddr *>(&sender_addr), &addr_len);
-
-      if (received <= 0)
+      catch (const NetworkError &e)
       {
         if (running_.load())
         {
-          throw NetworkError("Receive error", info_.name, info_.ip_address);
+          LOG("Receive error on interface " << info_.to_string() << ": " << e.what());
+          error_count_.fetch_add(1);
+          std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
-        continue;
-      }
-
-      // Feature 3: Increment message counter
-      msgs_this_sec_.fetch_add(1);
-
-      // Parse sender IP
-      std::string sender_ip;
-
-      if (sender_addr.ss_family == AF_INET)
-      {
-        char ip_str[INET_ADDRSTRLEN];
-        struct sockaddr_in *addr_in = reinterpret_cast<struct sockaddr_in *>(&sender_addr);
-        inet_ntop(AF_INET, &addr_in->sin_addr, ip_str, INET_ADDRSTRLEN);
-        sender_ip = ip_str;
-      }
-      else if (sender_addr.ss_family == AF_INET6)
-      {
-        char ip_str[INET6_ADDRSTRLEN];
-        struct sockaddr_in6 *addr_in6 = reinterpret_cast<struct sockaddr_in6 *>(&sender_addr);
-        inet_ntop(AF_INET6, &addr_in6->sin6_addr, ip_str, INET6_ADDRSTRLEN);
-        sender_ip = ip_str;
-
-        // For IPv6, include scope in the sender_ip string if it has one
-        try
-        {
-          auto sender_asio_addr = asio::ip::make_address_v6(sender_ip);
-          sender_asio_addr.scope_id(addr_in6->sin6_scope_id);
-          sender_ip = sender_asio_addr.to_string(); // This will include scope if needed
-        }
-        catch (const std::exception &e)
-        {
-          LOG("Failed to parse IPv6 sender address: " << e.what());
-          continue;
-        }
-      }
-
-      // Skip messages from ourselves
-      if (sender_ip == info_.ip_address)
-      {
-        continue;
-      }
-
-      // SIMPLE ASIO-based scope filtering (ONLY CHANGED LINE!)
-      if (!SimpleIPv6ScopeFilter::shouldAcceptMessage(sender_ip, info_.ip_address))
-      {
-        LOG("Filtered message from " << sender_ip << " on " << info_.name);
-        continue;
-      }
-
-      // Parse message
-      Message msg;
-      if (msg.deserialize(buffer, received))
-      {
-        if (service_)
-        {
-          service_->handle_received_message(msg, sender_ip, info_.name, info_.is_wired);
-        }
-      }
-
-      // Reset error count on successful receive
-      error_count_.store(0);
-    }
-    catch (const NetworkError &e)
-    {
-      if (running_.load())
-      {
-        LOG("Receive error on interface " << info_.to_string() << ": " << e.what());
-        error_count_.fetch_add(1);
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
       }
     }
+  }
+  catch (const std::exception& e)
+  {
+    LOG("Fatal error in receive loop for " << info_.to_string() << ": " << e.what());
+  }
+  catch (...)
+  {
+    LOG("Unknown fatal error in receive loop for " << info_.to_string());
   }
 
   LOG("Receive loop ended for interface: " << info_.to_string());
@@ -1350,13 +1431,16 @@ void InterfaceManager::start_scanning()
   // Start periodic scanning
   scan_timer_.start(std::chrono::milliseconds(INTERFACE_SCAN_INTERVAL_MS), [this]()
                     {
-        scan_interfaces();
-        repair_failed_interfaces(); });
+        if (!stopping_.load()) {
+          scan_interfaces();
+          repair_failed_interfaces();
+        } });
 }
 
 void InterfaceManager::stop_scanning()
 {
   LOG("Stopping interface scanning...");
+  stopping_.store(true);
   scan_timer_.stop();
 }
 
@@ -1375,6 +1459,8 @@ void InterfaceManager::stop_all()
 
 void InterfaceManager::scan_interfaces()
 {
+  if (stopping_.load()) return;
+
   auto current_interfaces = enumerate_interfaces();
   std::set<InterfaceInfo> current_set(current_interfaces.begin(), current_interfaces.end());
 
@@ -1408,6 +1494,8 @@ void InterfaceManager::scan_interfaces()
 
 void InterfaceManager::repair_failed_interfaces()
 {
+  if (stopping_.load()) return;
+
   std::lock_guard<std::mutex> lock(interfaces_mutex_);
 
   std::vector<InterfaceInfo> to_repair;
@@ -1691,7 +1779,9 @@ void InterfaceManager::add_interface(const InterfaceInfo &info)
   if (iface->start())
   {
     interfaces_[info] = std::move(iface);
-    service_->on_interface_added(info);
+    if (auto service = service_.lock()) {
+      service->on_interface_added(info);
+    }
   }
 }
 
@@ -1702,7 +1792,9 @@ void InterfaceManager::remove_interface(const InterfaceInfo &info)
   {
     it->second->stop();
     interfaces_.erase(it);
-    service_->on_interface_removed(info);
+    if (auto service = service_.lock()) {
+      service->on_interface_removed(info);
+    }
   }
 }
 
@@ -1912,7 +2004,8 @@ void start_discovery_impl(const char *info_string)
 
   if (!g_service)
   {
-    g_service = std::make_unique<DiscoveryService>();
+    g_service = std::make_shared<DiscoveryService>();
+    g_service->initialize();
   }
 
   g_service->start(info_string ? info_string : "");
@@ -1975,4 +2068,18 @@ void disable_nif_logging_impl()
 bool is_nif_logging_enabled_impl()
 {
   return g_logging_enabled.load();
+}
+
+// Feature 2: Mark endpoint as preferred
+bool mark_endpoint_preferred_impl(const std::string& peer_id, const std::string& ip_address,
+                                 const std::string& interface_name)
+{
+  std::lock_guard<std::mutex> lock(g_service_mutex);
+
+  if (!g_service)
+  {
+    return false;
+  }
+
+  return g_service->mark_endpoint_preferred(peer_id, ip_address, interface_name);
 }
